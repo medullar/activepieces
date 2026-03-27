@@ -5,10 +5,12 @@ import {
   StoreScope,
   createAction,
 } from '@activepieces/pieces-framework';
-import { googleSheetsAuth } from '../..';
+import { googleSheetsAuth } from '../common/common';
 import {
   areSheetIdsValid,
+  GoogleSheetsAuthValue,
   googleSheetsCommon,
+  mapRowsToHeaderNames,
 } from '../common/common';
 import { isNil } from '@activepieces/shared';
 import { HttpError } from '@activepieces/pieces-common';
@@ -19,27 +21,18 @@ import { commonProps } from '../common/props';
 
 async function getRows(
   store: Store,
-  auth: PiecePropValueSchema<typeof googleSheetsAuth>,
+  auth: GoogleSheetsAuthValue,
   spreadsheetId: string,
   sheetId: number,
   memKey: string,
   groupSize: number,
   startRow: number,
   headerRow: number,
+  useHeaderNames: boolean,
   testing: boolean
 ) {
-  const sheetName = await googleSheetsCommon.findSheetName(
-    auth.access_token,
-    spreadsheetId,
-    sheetId
-  );
-
   const sheetGridRange = await getWorkSheetGridSize(auth,spreadsheetId,sheetId);
   const existingGridRowCount = sheetGridRange.rowCount ??0;
-	// const existingGridColumnCount = sheetGridRange.columnCount??26;
-
-
-
   const memVal = await store.get(memKey, StoreScope.FLOW);
 
   let startingRow;
@@ -70,7 +63,7 @@ async function getRows(
   if (testing == false) await store.put(memKey, endRow, StoreScope.FLOW);
 
   const row = await googleSheetsCommon.getGoogleSheetRows({
-    accessToken: auth.access_token,
+    auth,
     sheetId: sheetId,
     spreadsheetId: spreadsheetId,
     rowIndex_s: startingRow,
@@ -81,7 +74,7 @@ async function getRows(
   if (row.length == 0) {
     const allRows = await googleSheetsCommon.getGoogleSheetRows({
       spreadsheetId: spreadsheetId,
-      accessToken: auth.access_token,
+      auth,
       sheetId: sheetId,
       rowIndex_s: undefined,
       rowIndex_e: undefined,
@@ -91,7 +84,16 @@ async function getRows(
     if (testing == false) await store.put(memKey, lastRow, StoreScope.FLOW);
   }
 
-  return row;
+  const finalRows = await mapRowsToHeaderNames(
+    row,
+    useHeaderNames,
+    spreadsheetId,
+    sheetId,
+    headerRow,
+    auth,
+  );
+  
+  return finalRows;
 }
 
 const notes = `
@@ -103,7 +105,7 @@ const notes = `
 export const getRowsAction = createAction({
   auth: googleSheetsAuth,
   name: 'get_next_rows',
-  description: 'Get next group of rows from a Google Sheet',
+  description: 'Get next group of rows from a specifiec workheet',
   displayName: 'Get next row(s)',
   props: {
     ...commonProps,
@@ -118,6 +120,12 @@ export const getRowsAction = createAction({
       description: 'Which row contains the headers?',
       required: true,
       defaultValue: 1,
+    }),
+    useHeaderNames: Property.Checkbox({
+    displayName: 'Use header names for keys',
+    description: 'Map A/B/C… to the actual column headers (row specified above).',
+    required: false,
+    defaultValue: false,
     }),
     markdown: Property.MarkDown({
       value: notes
@@ -136,7 +144,7 @@ export const getRowsAction = createAction({
     }),
   },
   async run({ store, auth, propsValue }) {
-    const { startRow, groupSize, memKey, headerRow, spreadsheetId, sheetId} = propsValue;
+    const { startRow, groupSize, memKey, headerRow, spreadsheetId, sheetId, useHeaderNames} = propsValue;
 
     if (!areSheetIdsValid(spreadsheetId, sheetId)) {
 			throw new Error('Please select a spreadsheet and sheet first.');
@@ -157,6 +165,7 @@ export const getRowsAction = createAction({
         groupSize,
         startRow,
         headerRow,
+        useHeaderNames as boolean,
         false
       );
     } catch (error) {
@@ -168,7 +177,7 @@ export const getRowsAction = createAction({
     }
   },
   async test({ store, auth, propsValue }) {
-    const { startRow, groupSize, memKey, headerRow, spreadsheetId, sheetId} = propsValue;
+    const { startRow, groupSize, memKey, headerRow, spreadsheetId, sheetId, useHeaderNames} = propsValue;
 
     if (!areSheetIdsValid(spreadsheetId, sheetId)) {
 			throw new Error('Please select a spreadsheet and sheet first.');
@@ -184,6 +193,7 @@ export const getRowsAction = createAction({
         groupSize,
         startRow,
         headerRow,
+        useHeaderNames as boolean,
         true
       );
     } catch (error) {

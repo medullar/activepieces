@@ -1,17 +1,46 @@
-import { pinoLogging } from '@activepieces/server-shared'
-import { ActivepiecesError, apId, EngineHttpResponse, ErrorCode, EventPayload, FlowRun, FlowStatus, isNil, PlatformUsageMetric, RunEnvironment, TriggerPayload } from '@activepieces/shared'
-import { trace } from '@opentelemetry/api'
+import { apId, assertNotNullOrUndefined, EngineHttpResponse, EventPayload, ExecutionType, Flow, FlowRun, FlowStatus, FlowVersionId, isNil, LATEST_JOB_DATA_SCHEMA_VERSION, PlatformId, ProgressUpdateType, ProjectId, RunEnvironment, TriggerPayload, WorkerJobType } from '@activepieces/shared'
+import { context, propagation, trace } from '@opentelemetry/api'
 import { FastifyBaseLogger } from 'fastify'
 import { StatusCodes } from 'http-status-codes'
-import { projectLimitsService } from '../ee/projects/project-plan/project-plan.service'
+import { flowExecutionCache } from '../flows/flow/flow-execution-cache'
+import { flowRunService } from '../flows/flow-run/flow-run-service'
+import { flowVersionRepo } from '../flows/flow-version/flow-version.service'
+import { pinoLogging } from '../helper/logger'
+import { rejectedPromiseHandler } from '../helper/promise-handler'
+import { system } from '../helper/system/system'
+import { AppSystemProp } from '../helper/system/system-props'
 import { triggerSourceService } from '../trigger/trigger-source/trigger-source-service'
 import { engineResponseWatcher } from '../workers/engine-response-watcher'
-import { handshakeHandler } from './handshake-handler'
-import { WebhookFlowVersionToRun, webhookHandler } from './webhook-handler'
+import { jobQueue, JobType } from '../workers/job-queue/job-queue'
+import { payloadOffloader } from '../workers/payload-offloader'
+import { webhookHandshake } from './webhook-handshake'
 
 const tracer = trace.getTracer('webhook-service')
+const WEBHOOK_TIMEOUT_MS = system.getNumberOrThrow(AppSystemProp.WEBHOOK_TIMEOUT_SECONDS) * 1000
+const MAX_PAYLOAD_SIZE_BYTES = system.getNumberOrThrow(AppSystemProp.MAX_WEBHOOK_PAYLOAD_SIZE_MB) * 1024 * 1024
+
+export enum WebhookFlowVersionToRun {
+    LOCKED_FALL_BACK_TO_LATEST = 'locked_fall_back_to_latest',
+    LATEST = 'latest',
+}
 
 export const webhookService = {
+    async getFlowVersionIdToRun(type: WebhookFlowVersionToRun, flow: Flow): Promise<FlowVersionId> {
+        if (type === WebhookFlowVersionToRun.LOCKED_FALL_BACK_TO_LATEST && !isNil(flow.publishedVersionId)) {
+            return flow.publishedVersionId
+        }
+
+        const flowVersionSchema = await flowVersionRepo().createQueryBuilder()
+            .select('id')
+            .where({
+                flowId: flow.id,
+            })
+            .orderBy('created', 'DESC')
+            .getRawOne()
+        assertNotNullOrUndefined(flowVersionSchema, 'Flow version not found')
+        return flowVersionSchema.id
+    },
+
     async handleWebhook({
         logger,
         data,
@@ -38,50 +67,50 @@ export const webhookService = {
                 const webhookRequestId = apId()
                 span.setAttribute('webhook.requestId', webhookRequestId)
                 const pinoLogger = pinoLogging.createWebhookContextLog({ log: logger, webhookId: webhookRequestId, flowId })
-
-                const triggerSourceResult = await triggerSourceService(pinoLogger).getByFlowIdPopulated({
+                const flowExecutionResult = await flowExecutionCache(pinoLogger).get({
                     flowId,
                     simulate: saveSampleData,
                 })
 
-                if (isNil(triggerSourceResult)) {
+                if (!flowExecutionResult.exists) {
                     pinoLogger.info('Flow not found, returning GONE')
                     span.setAttribute('webhook.flowFound', false)
                     return {
                         status: StatusCodes.GONE,
                         body: {},
-                        headers: {},
+                        headers: {
+                            [webhookHeader]: webhookRequestId,
+                        },
+                    }
+                }
+                const { flow } = flowExecutionResult
+                if (flow.status === FlowStatus.DISABLED && !saveSampleData) {
+                    pinoLogger.warn({ flowId }, 'Webhook received for disabled flow')
+                    span.setAttribute('webhook.triggerSourceFound', false)
+                    return {
+                        status: StatusCodes.NOT_FOUND,
+                        body: {},
+                        headers: {
+                            [webhookHeader]: webhookRequestId,
+                        },
                     }
                 }
 
-                const { flow, ...triggerSource } = triggerSourceResult
-
                 span.setAttribute('webhook.flowFound', true)
                 span.setAttribute('webhook.projectId', flow.projectId)
-                const flowVersionIdToRun = await webhookHandler.getFlowVersionIdToRun(flowVersionToRun, flow)
+                const flowVersionIdToRun = await webhookService.getFlowVersionIdToRun(flowVersionToRun, flow)
                 span.setAttribute('webhook.flowVersionId', flowVersionIdToRun)
 
-                const exceededLimit = await projectLimitsService(pinoLogger).checkTasksExceededLimit(flow.projectId)
-                if (exceededLimit) {
-                    span.setAttribute('webhook.quotaExceeded', true)
-                    throw new ActivepiecesError({
-                        code: ErrorCode.QUOTA_EXCEEDED,
-                        params: {
-                            metric: PlatformUsageMetric.TASKS,
-                        },
-                    })
-                }
-
-                const response = await handshakeHandler(pinoLogger).handleHandshakeRequest({
+                const response = await webhookHandshake.handleHandshakeRequest({
                     payload: (payload ?? await data(flow.projectId)) as TriggerPayload,
-                    handshakeConfiguration: await handshakeHandler(pinoLogger).getWebhookHandshakeConfiguration(triggerSource),
+                    handshakeConfiguration: flowExecutionResult.handshakeConfiguration ?? null,
                     flowId: flow.id,
                     flowVersionId: flowVersionIdToRun,
                     projectId: flow.projectId,
+                    logger: pinoLogger,
                 })
                 if (!isNil(response)) {
                     logger.info({
-                        message: 'Handshake request completed',
                         flowId: flow.id,
                         flowVersionId: flowVersionIdToRun,
                         webhookRequestId,
@@ -94,27 +123,31 @@ export const webhookService = {
                     }
                 }
 
-                const flowDisabledAndNoSaveSampleData = flow.status !== FlowStatus.ENABLED && !saveSampleData && flowVersionToRun === WebhookFlowVersionToRun.LOCKED_FALL_BACK_TO_LATEST
-                if (flowDisabledAndNoSaveSampleData) {
-                    span.setAttribute('webhook.flowDisabled', true)
+                pinoLogger.info('Adding webhook job to queue')
+
+                const resolvedPayload = payload ?? await data(flow.projectId)
+
+                const payloadSize = payloadOffloader.getPayloadSizeInBytes(resolvedPayload)
+                if (payloadSize > MAX_PAYLOAD_SIZE_BYTES) {
+                    pinoLogger.warn({ payloadSize, maxPayloadSizeBytes: MAX_PAYLOAD_SIZE_BYTES }, 'Webhook payload too large')
+                    span.setAttribute('webhook.payloadTooLarge', true)
                     return {
-                        status: StatusCodes.NOT_FOUND,
-                        body: {},
+                        status: StatusCodes.REQUEST_TOO_LONG,
+                        body: { message: 'Payload too large' },
                         headers: {
                             [webhookHeader]: webhookRequestId,
                         },
                     }
                 }
-                pinoLogger.info('Adding webhook job to queue')
-
 
                 if (async) {
                     span.setAttribute('webhook.mode', 'async')
-                    return await webhookHandler.handleAsync({
+                    return await handleAsync({
                         flow,
                         saveSampleData,
+                        platformId: flowExecutionResult.platformId,
                         flowVersionIdToRun,
-                        payload: payload ?? await data(flow.projectId),
+                        payload: resolvedPayload,
                         logger: pinoLogger,
                         webhookRequestId,
                         runEnvironment: flowVersionToRun === WebhookFlowVersionToRun.LOCKED_FALL_BACK_TO_LATEST ? RunEnvironment.PRODUCTION : RunEnvironment.TESTING,
@@ -127,10 +160,11 @@ export const webhookService = {
 
 
                 span.setAttribute('webhook.mode', 'sync')
-                const flowHttpResponse = await webhookHandler.handleSync({
-                    payload: payload ?? await data(flow.projectId),
+                const flowHttpResponse = await handleSync({
+                    payload: resolvedPayload,
                     projectId: flow.projectId,
                     flow,
+                    platformId: flowExecutionResult.platformId,
                     runEnvironment: flowVersionToRun === WebhookFlowVersionToRun.LOCKED_FALL_BACK_TO_LATEST ? RunEnvironment.PRODUCTION : RunEnvironment.TESTING,
                     logger: pinoLogger,
                     webhookRequestId,
@@ -158,6 +192,152 @@ export const webhookService = {
     },
 }
 
+async function handleAsync(params: AsyncWebhookParams): Promise<EngineHttpResponse> {
+    return tracer.startActiveSpan('webhook.handler.async', {
+        attributes: {
+            'webhook.flowId': params.flow.id,
+            'webhook.requestId': params.webhookRequestId,
+            'webhook.saveSampleData': params.saveSampleData,
+            'webhook.execute': params.execute,
+            'webhook.environment': params.runEnvironment,
+        },
+    }, async (span) => {
+        try {
+            const { flow, logger, webhookRequestId, payload, flowVersionIdToRun, webhookHeader, saveSampleData, execute, runEnvironment, parentRunId, failParentOnFailure, platformId } = params
+
+            span.setAttribute('webhook.platformId', platformId)
+
+            // Inject trace context for propagation across queue boundary
+            const traceContext: Record<string, string> = {}
+            propagation.inject(context.active(), traceContext)
+
+            const jobPayload = await payloadOffloader.offloadPayload(logger, payload, flow.projectId, platformId)
+
+            await jobQueue(logger).add({
+                id: webhookRequestId,
+                type: JobType.ONE_TIME,
+                data: {
+                    platformId,
+                    projectId: flow.projectId,
+                    schemaVersion: LATEST_JOB_DATA_SCHEMA_VERSION,
+                    requestId: webhookRequestId,
+                    payload: jobPayload,
+                    jobType: WorkerJobType.EXECUTE_WEBHOOK,
+                    flowId: flow.id,
+                    saveSampleData,
+                    flowVersionIdToRun,
+                    runEnvironment,
+                    execute,
+                    parentRunId,
+                    failParentOnFailure,
+                    traceContext,
+                },
+                dependOnJobId: !isNil(parentRunId) && failParentOnFailure ? parentRunId : undefined,
+            })
+            logger.info('Async webhook request completed')
+            span.setAttribute('webhook.queuedSuccessfully', true)
+            return {
+                status: StatusCodes.OK,
+                body: {},
+                headers: {
+                    [webhookHeader]: webhookRequestId,
+                },
+            }
+        }
+        finally {
+            span.end()
+        }
+    })
+}
+
+async function handleSync(params: SyncWebhookParams): Promise<EngineHttpResponse> {
+    return tracer.startActiveSpan('webhook.handler.sync', {
+        attributes: {
+            'webhook.flowId': params.flow.id,
+            'webhook.requestId': params.webhookRequestId,
+            'webhook.saveSampleData': params.saveSampleData,
+            'webhook.environment': params.runEnvironment,
+        },
+    }, async (span) => {
+        try {
+            const { payload, projectId, flow, logger, webhookRequestId, synchronousHandlerId, flowVersionIdToRun, runEnvironment, saveSampleData, flowVersionToRun, parentRunId, failParentOnFailure, platformId } = params
+
+            if (saveSampleData) {
+                rejectedPromiseHandler(savePayload({
+                    flow,
+                    logger,
+                    webhookRequestId,
+                    payload,
+                    platformId,
+                    flowVersionIdToRun,
+                    runEnvironment,
+                    parentRunId,
+                    failParentOnFailure,
+                }), logger)
+            }
+
+            const disabledFlow = flow.status !== FlowStatus.ENABLED && flowVersionToRun === WebhookFlowVersionToRun.LOCKED_FALL_BACK_TO_LATEST
+
+            if (disabledFlow) {
+                span.setAttribute('webhook.flowDisabled', true)
+                return {
+                    status: StatusCodes.NOT_FOUND,
+                    body: {},
+                    headers: {},
+                }
+            }
+
+            const createdRun = await flowRunService(logger).start({
+                platformId,
+                environment: runEnvironment,
+                flowId: flow.id,
+                flowVersionId: flowVersionIdToRun,
+                payload,
+                synchronousHandlerId,
+                projectId,
+                executeTrigger: true,
+                httpRequestId: webhookRequestId,
+                executionType: ExecutionType.BEGIN,
+                progressUpdateType: ProgressUpdateType.WEBHOOK_RESPONSE,
+                parentRunId,
+                failParentOnFailure,
+            })
+
+            span.setAttribute('webhook.runId', createdRun.id)
+            params.onRunCreated?.(createdRun)
+
+            const listenerResult = await engineResponseWatcher(logger).oneTimeListener<EngineHttpResponse>(webhookRequestId, true, WEBHOOK_TIMEOUT_MS, {
+                status: StatusCodes.NO_CONTENT,
+                body: {},
+                headers: {},
+            })
+            return listenerResult
+        }
+        finally {
+            span.end()
+        }
+    })
+}
+
+async function savePayload(params: Omit<AsyncWebhookParams, 'saveSampleData' | 'webhookHeader' | 'execute'>): Promise<void> {
+    const { flow, logger, webhookRequestId, payload, flowVersionIdToRun, runEnvironment, parentRunId, failParentOnFailure, platformId } = params
+    await handleAsync({
+        flow,
+        logger,
+        webhookRequestId,
+        payload,
+        flowVersionIdToRun,
+        saveSampleData: true,
+        runEnvironment,
+        execute: false,
+        webhookHeader: '',
+        platformId,
+        parentRunId,
+        failParentOnFailure,
+    })
+    await triggerSourceService(logger).disable({ flowId: flow.id, projectId: flow.projectId, simulate: true, ignoreError: true })
+}
+
 type HandleWebhookParams = {
     flowId: string
     async: boolean
@@ -167,6 +347,38 @@ type HandleWebhookParams = {
     logger: FastifyBaseLogger
     payload?: Record<string, unknown>
     execute: boolean
+    onRunCreated?: (run: FlowRun) => void
+    parentRunId?: string
+    failParentOnFailure: boolean
+}
+
+type AsyncWebhookParams = {
+    flow: Flow
+    logger: FastifyBaseLogger
+    webhookRequestId: string
+    platformId: PlatformId
+    payload: unknown
+    flowVersionIdToRun: FlowVersionId
+    webhookHeader: string
+    saveSampleData: boolean
+    runEnvironment: RunEnvironment
+    execute: boolean
+    parentRunId?: string
+    failParentOnFailure: boolean
+}
+
+type SyncWebhookParams = {
+    payload: unknown
+    saveSampleData: boolean
+    projectId: ProjectId
+    runEnvironment: RunEnvironment
+    platformId: PlatformId
+    flowVersionToRun: WebhookFlowVersionToRun
+    flow: Flow
+    logger: FastifyBaseLogger
+    webhookRequestId: string
+    synchronousHandlerId: string
+    flowVersionIdToRun: FlowVersionId
     onRunCreated?: (run: FlowRun) => void
     parentRunId?: string
     failParentOnFailure: boolean

@@ -1,12 +1,12 @@
 import { test, expect } from '../../../fixtures';
 
 test.describe('Webhooks', () => {
-  test('should handle webhook with return response', async ({ page, flowsPage, builderPage }) => {
+  test('should handle webhook with return response', async ({ page, automationsPage, builderPage }) => {
     test.setTimeout(120000);
 
-    await flowsPage.waitFor();
+    await automationsPage.waitFor();
 
-    await flowsPage.newFlowFromScratch();
+    await automationsPage.newFlowFromScratch();
 
     await builderPage.selectInitialTrigger({
       piece: 'Webhook',
@@ -27,6 +27,11 @@ test.describe('Webhooks', () => {
       piece: 'Webhook',
       action: 'Return Response'
     });
+
+    //clear
+    await page.locator('div.cm-activeLine.cm-line').fill(
+      ''
+    );
 
     await page.locator('div.cm-activeLine.cm-line').fill(
       '{"targetRunVersion": "{{trigger[\'queryParams\'][\'targetRunVersion\']}}"}'

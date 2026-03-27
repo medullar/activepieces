@@ -2,14 +2,13 @@ import {
   HttpMethod,
 } from '@activepieces/pieces-common';
 import {
-  PiecePropValueSchema,
   DynamicPropsValue,
   Property,
+  AppConnectionValueForAuthProperty,
 } from '@activepieces/pieces-framework';
-import { drupalAuth } from '../../';
-import { makeJsonApiRequest } from './jsonapi';
+import { drupalAuth } from '../auth';
+import { DrupalAuthType, makeJsonApiRequest } from './jsonapi';
 
-type DrupalAuthType = PiecePropValueSchema<typeof drupalAuth>;
 
 // =============================================================================
 // ENTITY TYPE DISCOVERY
@@ -28,7 +27,7 @@ type DrupalAuthType = PiecePropValueSchema<typeof drupalAuth>;
  * @returns Dropdown options for entity type selection
  */
 async function fetchEntityTypes(auth: DrupalAuthType, context: 'reading' | 'editing') {
-  if (!auth || !auth.website_url) {
+  if (!auth || !auth.props.website_url) {
     return {
       disabled: true,
       options: [],
@@ -40,7 +39,7 @@ async function fetchEntityTypes(auth: DrupalAuthType, context: 'reading' | 'edit
   const type = context === 'editing'
     ? 'form'
     : 'view';
-  const response = await makeJsonApiRequest(auth, `${auth.website_url}/jsonapi/entity_${type}_display/entity_${type}_display`, HttpMethod.GET);
+  const response = await makeJsonApiRequest(auth, `${auth.props.website_url}/jsonapi/entity_${type}_display/entity_${type}_display`, HttpMethod.GET);
   const data = (response.body as any).data || [];
   const allowedEntityTypes: string[] = [];
   data.forEach((entityType: any) => {
@@ -48,7 +47,7 @@ async function fetchEntityTypes(auth: DrupalAuthType, context: 'reading' | 'edit
   });
 
   try {
-    const response = await makeJsonApiRequest(auth, `${auth.website_url}/jsonapi`, HttpMethod.GET);
+    const response = await makeJsonApiRequest(auth, `${auth.props.website_url}/jsonapi`, HttpMethod.GET);
 
     if (response.status === 200) {
       const entityTypes: Array<{label: string; value: any}> = [];
@@ -96,11 +95,25 @@ async function fetchEntityTypes(auth: DrupalAuthType, context: 'reading' | 'edit
   };
 }
 
-export async function fetchEntityTypesForReading(auth: DrupalAuthType) {
+export async function fetchEntityTypesForReading(auth?: DrupalAuthType) {
+  if (!auth) {
+    return {
+      disabled: true,
+      options: [],
+      placeholder: 'Please configure authentication first',
+    };
+  }
   return await fetchEntityTypes(auth, 'reading');
 }
 
-export async function fetchEntityTypesForEditing(auth: DrupalAuthType) {
+export async function fetchEntityTypesForEditing(auth?: DrupalAuthType) {
+  if (!auth) {
+    return {
+      disabled: true,
+      options: [],
+      placeholder: 'Please configure authentication first',
+    };
+  }
   return await fetchEntityTypes(auth, 'editing');
 }
 
@@ -129,7 +142,7 @@ export async function fetchEntityFormDisplay(auth: DrupalAuthType, entityType: s
     const formDisplayId = `${entityType}.${bundle}.default`;
     const response = await makeJsonApiRequest(
       auth,
-      `${auth.website_url}/jsonapi/entity_form_display/entity_form_display?filter[drupal_internal__id]=${encodeURIComponent(formDisplayId)}`,
+      `${auth.props.website_url}/jsonapi/entity_form_display/entity_form_display?filter[drupal_internal__id]=${encodeURIComponent(formDisplayId)}`,
       HttpMethod.GET
     );
 
@@ -157,7 +170,7 @@ export async function fetchTextFormats(auth: DrupalAuthType) {
   try {
     const response = await makeJsonApiRequest(
       auth,
-      `${auth.website_url}/jsonapi/filter_format/filter_format`,
+      `${auth.props.website_url}/jsonapi/filter_format/filter_format`,
       HttpMethod.GET
     );
 
@@ -200,7 +213,7 @@ export async function fetchEntityFieldConfig(auth: DrupalAuthType, entityType: s
   try {
     const response = await makeJsonApiRequest(
       auth,
-      `${auth.website_url}/jsonapi/field_config/field_config?filter[entity_type]=${entityType}&filter[bundle]=${bundle}`,
+      `${auth.props.website_url}/jsonapi/field_config/field_config?filter[entity_type]=${entityType}&filter[bundle]=${bundle}`,
       HttpMethod.GET
     );
 
@@ -224,6 +237,50 @@ export async function fetchEntityFieldConfig(auth: DrupalAuthType, entityType: s
   }
 
   return {};
+}
+
+/**
+ * Checks if the entity type and bundle are supported by the workflow
+ *
+ * This gets the actual workflow configuration on the site and determines if the
+ * given entity type and bundle is supported by the workflow.
+ *
+ * @param auth - Drupal authentication credentials
+ * @param entityType - The entity type (e.g., 'node', 'user')
+ * @param bundle - The bundle (e.g., 'article', 'page')
+ * @returns True if the entity type and bundle are supported by the workflow,
+ * false otherwise
+ */
+export async function isEntitySupportingWorkflow(auth: DrupalAuthType, entityType: string, bundle: string): Promise<boolean> {
+  try {
+    const response = await makeJsonApiRequest(
+      auth,
+      `${auth.props.  website_url}/jsonapi/workflow/workflow`,
+      HttpMethod.GET
+    );
+
+    if (response.status === 200 && response.body) {
+      const workflows = (response.body as any).data || [];
+      let found = false;
+      workflows.forEach((workflow: any) => {
+        const attrs = workflow?.attributes ?? {};
+        const typeSettings = attrs?.type_settings ?? {};
+        const entityTypes = typeSettings?.entity_types ?? {};
+
+        if (!entityTypes) {
+          return;
+        }
+        if (entityTypes[entityType].includes(bundle)) {
+          found = true;
+        }
+      });
+      return found;
+    }
+  } catch (e) {
+    // Ignore this as the workflow may not be supported or the endpoint missing.
+  }
+
+  return false;
 }
 
 /**
@@ -300,6 +357,11 @@ export async function getEditableFieldsWithLabels(
     weight: number;
   }> = [];
 
+  const baseFields = ['title', 'name'];
+  if (!await isEntitySupportingWorkflow(auth, entityType, bundle)) {
+    baseFields.push('status');
+  }
+
   for (const [fieldName, config] of Object.entries(formDisplayContent)) {
     if (config && typeof config === 'object' && config.type) {
       const configInfo = fieldConfig[fieldName];
@@ -317,7 +379,7 @@ export async function getEditableFieldsWithLabels(
         }
       } else {
         // Base field - check if it's editable
-        if (['title', 'name', 'status'].includes(fieldName)) {
+        if (baseFields.includes(fieldName)) {
           fields.push({
             name: fieldName,
             type: fieldName === 'status' ? 'boolean' : 'string',
