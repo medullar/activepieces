@@ -18,11 +18,12 @@ import { Form, FormField, FormItem, FormMessage } from '@/components/ui/form';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { TagInput } from '@/components/ui/tag-input';
-import { INTERNAL_ERROR_TOAST, useToast } from '@/components/ui/use-toast';
 import { templatesApi } from '@/features/templates/lib/templates-api';
 import { CreateFlowTemplateRequest } from '@activepieces/ee-shared';
 import {
+  flowMigrations,
   FlowTemplate,
+  FlowVersionState,
   FlowVersionTemplate,
   TemplateType,
 } from '@activepieces/shared';
@@ -61,8 +62,6 @@ export const UpsertTemplateDialog = ({
     resolver: typeboxResolver(UpsertFlowTemplateSchema),
   });
 
-  const { toast } = useToast();
-
   const { mutate, isPending } = useMutation({
     mutationKey: ['create-template'],
     mutationFn: () => {
@@ -83,10 +82,6 @@ export const UpsertTemplateDialog = ({
     },
     onSuccess: () => {
       onDone();
-      setOpen(false);
-    },
-    onError: () => {
-      toast(INTERNAL_ERROR_TOAST);
       setOpen(false);
     },
   });
@@ -190,7 +185,28 @@ export const UpsertTemplateDialog = ({
                         e.target.files[0].text().then((text) => {
                           try {
                             const json = JSON.parse(text) as FlowTemplate;
-                            field.onChange(json.template);
+                            const migratedFlowVersion = flowMigrations.apply({
+                              agentIds: [],
+                              connectionIds: [],
+                              created: new Date().toISOString(),
+                              displayName: '',
+                              flowId: '',
+                              id: '',
+                              updated: new Date().toISOString(),
+                              updatedBy: '',
+                              valid: false,
+                              trigger: json.template.trigger,
+                              state: FlowVersionState.DRAFT,
+                            });
+                            const migratedTemplate: FlowVersionTemplate = {
+                              trigger: migratedFlowVersion.trigger,
+                              agentIds: migratedFlowVersion.agentIds,
+                              connectionIds: migratedFlowVersion.connectionIds,
+                              displayName: migratedFlowVersion.displayName,
+                              valid: migratedFlowVersion.valid,
+                              schemaVersion: migratedFlowVersion.schemaVersion,
+                            };
+                            field.onChange(migratedTemplate);
                           } catch (e) {
                             form.setError('template', {
                               message: t('Invalid JSON'),

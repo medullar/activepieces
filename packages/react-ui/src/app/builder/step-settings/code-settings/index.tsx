@@ -18,7 +18,7 @@ import {
 
 import { useBuilderStateContext } from '../../builder-hooks';
 import { DictionaryProperty } from '../../piece-properties/dictionary-property';
-import { AskAiButton } from '../../pieces-selector/ask-ai';
+import { AskAiButton } from '../ask-ai';
 
 import { CodeEditor } from './code-editor';
 
@@ -52,7 +52,7 @@ const CodeSettings = React.memo(({ readonly }: CodeSettingsProps) => {
             <div className="pb-4">
               <ApMarkdown markdown={markdown} variant={MarkdownVariant.INFO} />
             </div>
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between !mb-2">
               <FormLabel>{t('Inputs')}</FormLabel>
               {isCopilotEnabled && !readonly && (
                 <AskAiButton

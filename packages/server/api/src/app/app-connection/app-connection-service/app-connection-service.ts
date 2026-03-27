@@ -1,4 +1,4 @@
-import { AppSystemProp, UserInteractionJobType } from '@activepieces/server-shared'
+import { AppSystemProp } from '@activepieces/server-shared'
 import {
     ActivepiecesError,
     ApEdition,
@@ -26,13 +26,14 @@ import {
     spreadIfDefined,
     UpsertAppConnectionRequestBody,
     UserId,
+    WorkerJobType,
 } from '@activepieces/shared'
 import { FastifyBaseLogger } from 'fastify'
 import { EngineHelperResponse, EngineHelperValidateAuthResult } from 'server-worker'
 import { Equal, FindOperator, FindOptionsWhere, ILike, In } from 'typeorm'
 import { repoFactory } from '../../core/db/repo-factory'
 import { APArrayContains } from '../../database/database-connection'
-import { projectMemberService } from '../../ee/project-members/project-member.service'
+import { projectMemberService } from '../../ee/projects/project-members/project-member.service'
 import { flowService } from '../../flows/flow/flow.service'
 import { encryptUtils } from '../../helper/encryption'
 import { buildPaginator } from '../../helper/pagination/build-paginator'
@@ -67,7 +68,7 @@ export const appConnectionService = (log: FastifyBaseLogger) => ({
             platformId,
         }, log)
 
-        const encryptedConnectionValue = encryptUtils.encryptObject({
+        const encryptedConnectionValue = await encryptUtils.encryptObject({
             ...validatedConnectionValue,
             ...value,
         })
@@ -255,9 +256,9 @@ export const appConnectionService = (log: FastifyBaseLogger) => ({
         limit,
         scope,
         platformId,
+        externalIds,
     }: ListParams): Promise<SeekPage<AppConnection>> {
         const decodedCursor = paginationHelper.decodeCursor(cursorRequest)
-
         const paginator = buildPaginator({
             entity: AppConnectionEntity,
             query: {
@@ -282,15 +283,16 @@ export const appConnectionService = (log: FastifyBaseLogger) => ({
         if (!isNil(status)) {
             querySelector.status = In(status)
         }
+        if (!isNil(externalIds)) {
+            querySelector.externalId = In(externalIds)
+        }
         const queryBuilder = appConnectionsRepo()
             .createQueryBuilder('app_connection')
             .where(querySelector)
         const { data, cursor } = await paginator.paginate(queryBuilder)
 
-
-
         const promises = data.map(async (encryptedConnection) => {
-            const apConnection: AppConnection = appConnectionHandler(log).decryptConnection(encryptedConnection)
+            const apConnection: AppConnection = await appConnectionHandler(log).decryptConnection(encryptedConnection)
             const owner = isNil(apConnection.ownerId) ? null : await userService.getMetaInformation({
                 id: apConnection.ownerId,
             })
@@ -331,7 +333,7 @@ export const appConnectionService = (log: FastifyBaseLogger) => ({
         projectId: ProjectId,
         log: FastifyBaseLogger,
     ): Promise<AppConnection | null> {
-        const appConnection = appConnectionHandler(log).decryptConnection(encryptedAppConnection)
+        const appConnection = await appConnectionHandler(log).decryptConnection(encryptedAppConnection)
         if (!appConnectionHandler(log).needRefresh(appConnection, log)) {
             return oauth2Util(log).removeRefreshTokenAndClientSecret(appConnection)
         }
@@ -447,6 +449,7 @@ const validateConnectionValue = async (
                 platformId,
                 props: value.props,
             })
+            
             const auth = await oauth2Handler[value.type](log).claim({
                 projectId,
                 platformId,
@@ -461,6 +464,7 @@ const validateConnectionValue = async (
                     clientSecret: value.client_secret,
                     authorizationMethod: value.authorization_method,
                     codeVerifier: value.code_challenge,
+                    scope: value.scope,
                 },
             })
             await engineValidateAuth({
@@ -508,13 +512,11 @@ const engineValidateAuth = async (
         piece: await getPiecePackageWithoutArchive(log, projectId, platformId, {
             pieceName,
             pieceVersion: pieceMetadata.version,
-            pieceType: pieceMetadata.pieceType,
-            packageType: pieceMetadata.packageType,
         }),
         projectId,
         platformId,
         connectionValue: auth,
-        jobType: UserInteractionJobType.EXECUTE_VALIDATION,
+        jobType: WorkerJobType.EXECUTE_VALIDATION,
     })
 
     if (engineResponse.status !== EngineResponseStatus.OK) {
@@ -597,6 +599,7 @@ type ListParams = {
     displayName: string | undefined
     status: AppConnectionStatus[] | undefined
     limit: number
+    externalIds: string[] | undefined
 }
 
 type UpdateParams = {

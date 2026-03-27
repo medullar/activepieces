@@ -10,7 +10,6 @@ import { t } from 'i18next';
 import React, { useState, useEffect } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { useDeepCompareEffect } from 'react-use';
-import { v4 as uuid } from 'uuid';
 
 import {
   Table,
@@ -21,7 +20,7 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import { cn } from '@/lib/utils';
-import { isNil, SeekPage } from '@activepieces/shared';
+import { apId, isNil, SeekPage } from '@activepieces/shared';
 
 import { Button } from '../button';
 import {
@@ -34,7 +33,7 @@ import {
 
 import { DataTableBulkActions } from './data-table-bulk-actions';
 import { DataTableColumnHeader } from './data-table-column-header';
-import { DataTableFacetedFilter } from './data-table-options-filter';
+import { DataTableFilter, DataTableFilterProps } from './data-table-filter';
 import { DataTableSkeleton } from './data-table-skeleton';
 import { DataTableToolbar } from './data-table-toolbar';
 
@@ -49,23 +48,10 @@ export type RowDataWithActions<TData extends DataWithId> = TData & {
 export const CURSOR_QUERY_PARAM = 'cursor';
 export const LIMIT_QUERY_PARAM = 'limit';
 
-export type DataTableFilter<Keys extends string> = {
-  type: 'select' | 'input' | 'date';
-  title: string;
-  accessorKey: Keys;
-  icon: React.ComponentType<{ className?: string }>;
-  options: readonly {
-    label: string;
-    value: string;
-    icon?: React.ComponentType<{ className?: string }>;
-  }[];
-};
-
 type DataTableAction<TData extends DataWithId> = (
   row: RowDataWithActions<TData>,
 ) => JSX.Element;
 
-// Extend the ColumnDef type to include the notClickable property
 type ColumnDef<TData, TValue> = TanstackColumnDef<TData, TValue> & {
   notClickable?: boolean;
 };
@@ -74,7 +60,6 @@ interface DataTableProps<
   TData extends DataWithId,
   TValue,
   Keys extends string,
-  F extends DataTableFilter<Keys>,
 > {
   columns: ColumnDef<RowDataWithActions<TData>, TValue>[];
   page: SeekPage<TData> | undefined;
@@ -84,7 +69,7 @@ interface DataTableProps<
     e: React.MouseEvent<HTMLTableRowElement, MouseEvent>,
   ) => void;
   isLoading: boolean;
-  filters?: F[];
+  filters?: DataTableFilters<Keys>[];
   customFilters?: React.ReactNode[];
   onSelectedRowsChange?: (rows: RowDataWithActions<TData>[]) => void;
   actions?: DataTableAction<TData>[];
@@ -94,6 +79,10 @@ interface DataTableProps<
   emptyStateTextDescription: string;
   emptyStateIcon: React.ReactNode;
 }
+
+export type DataTableFilters<Keys extends string> = DataTableFilterProps & {
+  accessorKey: Keys;
+};
 
 export type BulkAction<TData extends DataWithId> = {
   render: (
@@ -106,12 +95,11 @@ export function DataTable<
   TData extends DataWithId,
   TValue,
   Keys extends string,
-  F extends DataTableFilter<Keys>,
 >({
   columns: columnsInitial,
   page,
   onRowClick,
-  filters = [] as F[],
+  filters = [],
   actions = [],
   isLoading,
   onSelectedRowsChange,
@@ -121,7 +109,7 @@ export function DataTable<
   emptyStateTextDescription,
   emptyStateIcon,
   customFilters,
-}: DataTableProps<TData, TValue, Keys, F>) {
+}: DataTableProps<TData, TValue, Keys>) {
   const columns =
     actions.length > 0
       ? columnsInitial.concat([
@@ -146,6 +134,13 @@ export function DataTable<
           },
         ])
       : columnsInitial;
+
+  const columnVisibility = columnsInitial.reduce((acc, column) => {
+    if (column.enableHiding && 'accessorKey' in column) {
+      acc[column.accessorKey as string] = false;
+    }
+    return acc;
+  }, {} as Record<string, boolean>);
 
   const [searchParams, setSearchParams] = useSearchParams();
   const startingCursor = searchParams.get('cursor') || undefined;
@@ -192,11 +187,12 @@ export function DataTable<
     columns,
     manualPagination: true,
     getCoreRowModel: getCoreRowModel(),
-    getRowId: () => uuid(),
+    getRowId: () => apId(),
     initialState: {
       pagination: {
         pageSize: parseInt(startingLimit),
       },
+      columnVisibility,
     },
   });
 
@@ -249,12 +245,10 @@ export function DataTable<
             <div className="flex items-center space-x-2">
               {filters &&
                 filters.map((filter) => (
-                  <DataTableFacetedFilter
+                  <DataTableFilter
                     key={filter.accessorKey}
-                    type={filter.type}
                     column={table.getColumn(filter.accessorKey)}
-                    title={filter.title}
-                    options={filter.options}
+                    {...filter}
                   />
                 ))}
               {customFilters &&
@@ -277,7 +271,7 @@ export function DataTable<
         </DataTableToolbar>
       )}
 
-      <div className="rounded-md border mt-0">
+      <div className="rounded-md border mt-0 overflow-hidden">
         <Table>
           <TableHeader>
             {table.getHeaderGroups().map((headerGroup) => (
@@ -344,7 +338,12 @@ export function DataTable<
                 >
                   {row.getVisibleCells().map((cell) => (
                     <TableCell key={cell.id}>
-                      <div className="flex items-center justify-start">
+                      <div
+                        className={cn('flex items-center', {
+                          'justify-end': cell.column.id === 'actions',
+                          'justify-start': cell.column.id !== 'actions',
+                        })}
+                      >
                         <div
                           onClick={(e) => {
                             if (cell.column.id === 'select') {

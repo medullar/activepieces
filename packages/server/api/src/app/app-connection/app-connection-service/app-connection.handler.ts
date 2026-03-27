@@ -76,7 +76,7 @@ export const appConnectionHandler = (log: FastifyBaseLogger) => ({
     }) {
         const refreshLock = await distributedLock.acquireLock({
             key: `${projectId}_${externalId}`,
-            timeout: 20000,
+            timeout: 60000,
             log,
         })
 
@@ -90,7 +90,7 @@ export const appConnectionHandler = (log: FastifyBaseLogger) => ({
             if (isNil(encryptedAppConnection)) {
                 return encryptedAppConnection
             }
-            appConnection = this.decryptConnection(encryptedAppConnection)
+            appConnection = await this.decryptConnection(encryptedAppConnection)
             if (!this.needRefresh(appConnection, log)) {
                 return appConnection
             }
@@ -98,7 +98,7 @@ export const appConnectionHandler = (log: FastifyBaseLogger) => ({
 
             await appConnectionsRepo().update(refreshedAppConnection.id, {
                 status: AppConnectionStatus.ACTIVE,
-                value: encryptUtils.encryptObject(refreshedAppConnection.value),
+                value: await encryptUtils.encryptObject(refreshedAppConnection.value),
             })
             return refreshedAppConnection
         }
@@ -117,10 +117,10 @@ export const appConnectionHandler = (log: FastifyBaseLogger) => ({
         }
         return appConnection
     },
-    decryptConnection(
+    async decryptConnection(
         encryptedConnection: AppConnectionSchema,
-    ): AppConnection {
-        const value = encryptUtils.decryptObject<AppConnectionValue>(encryptedConnection.value)
+    ): Promise<AppConnection> {
+        const value = await encryptUtils.decryptObject<AppConnectionValue>(encryptedConnection.value)
         const connection: AppConnection = {
             ...encryptedConnection,
             value,
@@ -194,7 +194,6 @@ async function handleDraftVersion(flow: Flow, lastVersion: FlowVersion, userId: 
     })
 
 }
-
 function replaceConnectionInFlowVersion(flowVersion: FlowVersion, appConnection: AppConnectionWithoutSensitiveData, newAppConnection: AppConnectionWithoutSensitiveData) {
     return flowStructureUtil.transferFlow(flowVersion, (step) => {
         if (step.settings?.input?.auth?.includes(appConnection.externalId)) {
@@ -204,13 +203,20 @@ function replaceConnectionInFlowVersion(flowVersion: FlowVersion, appConnection:
                     ...step.settings,
                     input: {
                         ...step.settings?.input,
-                        auth: step.settings.input.auth.replaceAll(appConnection.externalId, newAppConnection.externalId),
+                        auth: replaceConnectionIdInAuth(step.settings.input.auth, appConnection.externalId, newAppConnection.externalId),
                     },
                 },
             }
         }
         return step
     })
+}
+
+function replaceConnectionIdInAuth(auth: string, oldConnectionId: string, newConnectionId: string): string {
+    return auth.replace(
+        new RegExp(`connections\\['${oldConnectionId}'\\]`, 'g'),
+        `connections['${newConnectionId}']`,
+    )
 }
 
 type UpdateFlowsWithAppConnectionParams = {

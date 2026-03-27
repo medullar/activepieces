@@ -3,39 +3,28 @@ import { Nullable } from '../common'
 import { FlowRunResponse } from '../flow-run/execution/flow-execution'
 import { ProgressUpdateType } from './engine-operation'
 
+export enum UpdateLogsBehavior {
+    UPDATE_LOGS = 'UPDATE_LOGS',
+    UPDATE_LOGS_SIZE = 'UPDATE_LOGS_SIZE',
+    NONE = 'NONE',
+}
+
 export const UpdateRunProgressRequest = Type.Object({
     runDetails: Type.Omit(FlowRunResponse, ['steps']),
     executionStateBuffer: Type.Optional(Type.String()),
     executionStateContentLength: Type.Union([Type.Number(), Type.Null()]),
+    updateLogsBehavior: Type.Enum(UpdateLogsBehavior),
     runId: Type.String(),
     progressUpdateType: Type.Optional(Type.Enum(ProgressUpdateType)),
     workerHandlerId: Nullable(Type.String()),
     httpRequestId: Nullable(Type.String()),
+    failedStepName: Type.Optional(Type.String()),
+    logsFileId: Type.Optional(Type.String()),
+    testSingleStepMode: Type.Optional(Type.Boolean()),
 })
 
 export type UpdateRunProgressRequest = Static<typeof UpdateRunProgressRequest>
 
-export const UpdateRunProgressResponse = Type.Object({
-    uploadUrl: Type.Optional(Type.String()),
-})
-export type UpdateRunProgressResponse = Static<typeof UpdateRunProgressResponse>
-
-
-export const NotifyFrontendRequest = Type.Object({
-    runId: Type.String(),
-})
-export type NotifyFrontendRequest = Static<typeof NotifyFrontendRequest>
-
-export const RemoveStableJobEngineRequest = Type.Object({
-    flowId: Type.Optional(Type.String()),
-    flowVersionId: Type.String(),
-})
-export type RemoveStableJobEngineRequest = Static<typeof RemoveStableJobEngineRequest>
-export enum GetFlowVersionForWorkerRequestType {
-    LATEST = 'LATEST',
-    LOCKED = 'LOCKED',
-    EXACT = 'EXACT',
-}
 
 export const SendFlowResponseRequest = Type.Object({
     workerHandlerId: Type.String(),
@@ -47,19 +36,8 @@ export const SendFlowResponseRequest = Type.Object({
     }),
 })
 export type SendFlowResponseRequest = Static<typeof SendFlowResponseRequest>
-export const GetFlowVersionForWorkerRequest = Type.Union([
-    Type.Object({
-        type: Type.Literal(GetFlowVersionForWorkerRequestType.LATEST),
-        flowId: Type.String(),
-    }),
-    Type.Object({
-        type: Type.Literal(GetFlowVersionForWorkerRequestType.LOCKED),
-        flowId: Type.String(),
-    }),
-    Type.Object({
-        type: Type.Literal(GetFlowVersionForWorkerRequestType.EXACT),
-        versionId: Type.String(),
-    }),
-])
+export const GetFlowVersionForWorkerRequest = Type.Object({
+    versionId: Type.String(),
+})
 
 export type GetFlowVersionForWorkerRequest = Static<typeof GetFlowVersionForWorkerRequest>

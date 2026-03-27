@@ -1,23 +1,31 @@
 import { spawn } from 'child_process'
-import { Server } from 'http'
-import path, { resolve } from 'path'
+import fs from 'fs/promises'
+import { resolve } from 'path'
 import { ApLock, filePiecesUtils, memoryLock, PiecesSource } from '@activepieces/server-shared'
 import { debounce, isNil, WebsocketClientEvent } from '@activepieces/shared'
 import chalk from 'chalk'
 import chokidar from 'chokidar'
 import { FastifyBaseLogger, FastifyInstance } from 'fastify'
-import { cacheHandler } from '../../utils/cache-handler'
+import { Server } from 'socket.io'
+import { cacheState } from '../../cache/cache-state'
+import { CacheState, GLOBAL_CACHE_COMMON_PATH } from '../../cache/worker-cache'
 
 export const PIECES_BUILDER_MUTEX_KEY = 'pieces-builder'
 
-const globalCachePath = path.resolve('cache')
-
-enum CacheState {
-    READY = 'READY',
-    PENDING = 'PENDING',
+async function checkBuildTarget(nxProjectFilePath: string): Promise<string> {
+    try {
+        const nxProjectJson = JSON.parse(await fs.readFile(nxProjectFilePath, 'utf-8'))
+        if ('targets' in nxProjectJson && nxProjectJson.targets && nxProjectJson.targets['build-with-deps']) {
+            return 'build-with-deps'
+        }
+        return 'build'
+    }
+    catch (error) {
+        return 'build'
+    }
 }
 
-async function handleFileChange(packages: string[], pieceProjectName: string, piecePackageName: string, io: Server, log: FastifyBaseLogger): Promise<void> {
+async function handleFileChange(packages: string[], pieceProjectName: string, piecePackageName: string, nxProjectFilePath: string, io: Server, log: FastifyBaseLogger): Promise<void> {
     log.info(
         chalk.blueBright.bold(
             '👀 Detected changes in pieces. Waiting... 👀 ' + pieceProjectName,
@@ -27,18 +35,30 @@ async function handleFileChange(packages: string[], pieceProjectName: string, pi
     try {
         lock = await memoryLock.acquire(PIECES_BUILDER_MUTEX_KEY)
 
-        log.info(chalk.blue.bold('🤌 Building pieces... 🤌'))
+        const buildTarget = await checkBuildTarget(nxProjectFilePath)
+        log.info(chalk.blue.bold(`🤌 Building pieces with target: ${buildTarget} for ${pieceProjectName}... 🤌`))
+
         if (!/^[A-Za-z0-9-]+$/.test(pieceProjectName)) {
             throw new Error(`Piece package name contains invalid character: ${pieceProjectName}`)
         }
-        const cmd = `npx nx run-many -t build --projects=${pieceProjectName}`
+
+        const cmd = `npx nx run-many -t ${buildTarget} --projects=${pieceProjectName}`
+
+        const startTime = Date.now()
         await runCommandWithLiveOutput(cmd)
         await filePiecesUtils(packages, log).clearPieceCache(piecePackageName)
-        
-        const cache = cacheHandler(globalCachePath)
+        const endTime = Date.now()
+        const buildTime = (endTime - startTime) / 1000
+
+        log.info(chalk.blue.bold(`Build completed in ${buildTime.toFixed(2)} seconds`))
+
+        await filePiecesUtils(packages, log).clearPieceCache(piecePackageName)
+
+        const cache = cacheState(GLOBAL_CACHE_COMMON_PATH)
         await cache.setCache('@activepieces/pieces-framework', CacheState.PENDING)
         await cache.setCache('@activepieces/pieces-common', CacheState.PENDING)
         await cache.setCache('@activepieces/shared', CacheState.PENDING)
+        await cache.setCache('@activepieces/common-ai', CacheState.PENDING)
         await cache.setCache(piecePackageName, CacheState.PENDING)
 
         io.emit(WebsocketClientEvent.REFRESH_PIECE)
@@ -96,8 +116,9 @@ export async function piecesBuilder(app: FastifyInstance, io: Server, packages: 
 
         const pieceProjectName = `pieces-${packageName}`
         const packageJsonName = await filePiecesUtils(packages, app.log).getPackageNameFromFolderPath(pieceDirectory)
+        const nxProjectJson = await filePiecesUtils(packages, app.log).getProjectJsonFromFolderPath(pieceDirectory)
         const debouncedHandleFileChange = debounce(() => {
-            handleFileChange(packages, pieceProjectName, packageJsonName, io, app.log).catch(app.log.error)
+            handleFileChange(packages, pieceProjectName, packageJsonName, nxProjectJson, io, app.log).catch(app.log.error)
         }, 2000)
 
         const watcher = chokidar.watch(resolve(pieceDirectory), {

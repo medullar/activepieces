@@ -1,8 +1,11 @@
+import './instrumentation'
 
+import { ApLock } from '@activepieces/server-shared'
+import dayjs from 'dayjs'
 import { FastifyInstance } from 'fastify'
 import { appPostBoot } from './app/app'
 import { initializeDatabase } from './app/database'
-import { initializeLock } from './app/helper/lock'
+import { distributedLock } from './app/helper/lock'
 import { system } from './app/helper/system/system'
 import { setupServer } from './app/server'
 import { workerPostBoot } from './app/worker'
@@ -56,17 +59,29 @@ function setupTimeZone(): void {
 const main = async (): Promise<void> => {
     setupTimeZone()
     if (system.isApp()) {
-        await initializeDatabase({ runMigrations: true })
-        initializeLock()
+        let lock: ApLock | undefined
+        try {
+            lock = await distributedLock.acquireLock({
+                key: 'database-migration-lock',
+                timeout: dayjs.duration(10, 'minutes').asMilliseconds(),
+                log: system.globalLogger(),
+            })
+            await initializeDatabase({ runMigrations: true })
+        }
+        finally {
+            if (lock) {
+                await lock.release()
+            }
+        }
     }
     const app = await setupServer()
 
-    process.on('SIGINT', () => {
-        stop(app).catch((e) => system.globalLogger().error(e, '[Main#stop]'))
+    process.on('SIGINT', async () => {
+        await stop(app).catch((e) => system.globalLogger().error(e, '[Main#stop]'))
     })
 
-    process.on('SIGTERM', () => {
-        stop(app).catch((e) => system.globalLogger().error(e, '[Main#stop]'))
+    process.on('SIGTERM', async () => {
+        await stop(app).catch((e) => system.globalLogger().error(e, '[Main#stop]'))
     })
 
     await start(app)
